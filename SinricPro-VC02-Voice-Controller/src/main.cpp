@@ -1,16 +1,21 @@
 /*
  * ESP8266/ESP32 SinricPro Multi-Switch with VC02 Voice Controller Integration
- * Features:
- * - WiFi connection stability with delayed relay response
- * - UART communication with VC02 voice controller
- * - Manual flip switch control
- * - Cloud sync via SinricPro
  * 
- * Hardware UART Commands from VC02:
- * - AA00 = LED OFF (Device 1)
- * - AA11 = LED ON  (Device 1)
- * - BB00 = FAN OFF (Device 2)
- * - BB11 = FAN ON  (Device 2)
+ * Hardware Configuration:
+ * - ACTIVE-LOW Relays: LOW = ON, HIGH = OFF
+ * - ACTIVE-HIGH Touch Sensors: HIGH = Touched, LOW = Not Touched
+ * 
+ * Pin Configuration (ESP8266):
+ * - Touch Sensor 1 (LED): D1 (GPIO5)
+ * - Touch Sensor 2 (FAN): D2 (GPIO4)
+ * - Relay 1 (LED): D5 (GPIO14) - Active LOW
+ * - Relay 2 (FAN): D8 (GPIO15) - Active LOW
+ * - VC02 RX: D6 (GPIO12)
+ * - VC02 TX: D7 (GPIO13)
+ * 
+ * UART Commands from VC02:
+ * - AA00 = LED OFF, AA11 = LED ON
+ * - BB00 = FAN OFF, BB11 = FAN ON
  */
 
 #ifdef ENABLE_DEBUG
@@ -40,105 +45,131 @@
 
 // ====== UART Configuration for VC02 ======
 #if defined(ESP8266)
-  // ESP8266: Using SoftwareSerial on D6(RX), D7(TX)
-  #define VC02_RX_PIN 1  // Connect to VC02 TX
-  #define VC02_TX_PIN 3  // Connect to VC02 RX
+  #define VC02_RX_PIN 12  // D6 -> GPIO12 - Connect to VC02 TX
+  #define VC02_TX_PIN 3  // RX -> GPIO13 - Connect to VC02 RX
   SoftwareSerial VC02Serial(VC02_RX_PIN, VC02_TX_PIN);
 #elif defined(ESP32)
-  // ESP32: Using Hardware Serial2 on GPIO16(RX), GPIO17(TX)
-  #define VC02_RX_PIN 16  // Connect to VC02 TX
-  #define VC02_TX_PIN 17  // Connect to VC02 RX
+  #define VC02_RX_PIN 16
+  #define VC02_TX_PIN 17
   HardwareSerial VC02Serial(2);
 #endif
 
 #define VC02_BAUD_RATE 9600
 
-// ====== Device Configuration ======
-#define TACTILE_BUTTON 1  // Comment out if using toggle switches
-#define BAUD_RATE   115200
-#define DEBOUNCE_TIME 250
+// ====== Pin Configuration (ESP8266 NodeMCU) ======
+// Touch Sensors (Active HIGH - 3.3V when touched)
+#define TOUCH_SENSOR_LED  5   // D1 -> GPIO5
+#define TOUCH_SENSOR_FAN  4   // D2 -> GPIO4
 
-// WiFi Stability Settings
-#define WIFI_CHECK_INTERVAL 5000    // Check WiFi every 5 seconds
-#define MIN_WIFI_STRENGTH -70       // Minimum WiFi signal strength (dBSSI)
-#define RELAY_RESPONSE_DELAY 300    // Delay before relay responds (ms)
+// Relays (Active LOW - GND to turn ON)
+#define RELAY_LED        14   // D5 -> GPIO14
+#define RELAY_FAN        13   // D7 -> GPIO13
 
+// ====== System Configuration ======
+#define BAUD_RATE            115200
+#define DEBOUNCE_TIME        250
+#define WIFI_CHECK_INTERVAL  5000
+#define MIN_WIFI_STRENGTH    -70
+#define RELAY_RESPONSE_DELAY 300
+
+// Device configuration structure
 typedef struct {
   int relayPIN;
-  int flipSwitchPIN;
-  bool activeLow;
-  String deviceName;  // "LED" or "FAN"
+  int touchSensorPIN;
+  String deviceName;
 } deviceConfig_t;
 
-// Device Configuration Map
-// Device 1 (LED): GPIO5 relay, GPIO14 switch
-// Device 2 (FAN): GPIO4 relay, GPIO12 switch
+// Device mapping with SinricPro Device IDs
 std::map<String, deviceConfig_t> devices = {
-    // {deviceId, {relayPIN, flipSwitchPIN, activeLow, deviceName}}
-    {"688c44e8ddd2551252bb6f0f", {5, 14, false, "LED"}},
-    {"688c44acedeca866fe97c5f1", {4, 12, false, "FAN"}},
+    // {deviceId, {relayPIN, touchSensorPIN, deviceName}}
+    {"688c44e8ddd2551252bb6f0f", {RELAY_LED, TOUCH_SENSOR_LED, "LED"}},
+    {"688c44acedeca866fe97c5f1", {RELAY_FAN, TOUCH_SENSOR_FAN, "FAN"}},
 };
 
+// Touch sensor state tracking
 typedef struct {
   String deviceId;
-  bool lastFlipSwitchState;
-  unsigned long lastFlipSwitchChange;
-  bool activeLow;
-} flipSwitchConfig_t;
+  bool lastTouchState;
+  unsigned long lastTouchChange;
+} touchSensorConfig_t;
 
-std::map<int, flipSwitchConfig_t> flipSwitches;
+std::map<int, touchSensorConfig_t> touchSensors;
 
-// WiFi Status Variables
+// System status variables
 unsigned long lastWiFiCheck = 0;
 bool wifiConnected = false;
 bool sinricConnected = false;
-
-// UART Command Buffer
 String uartBuffer = "";
+uint16_t receivedValue = 0;  // Store combined hex value from VC02
 
 // ====== Function Prototypes ======
 void setupRelays();
-void setupFlipSwitches();
+void setupTouchSensors();
 void setupWiFi();
 void setupSinricPro();
 void setupVC02Serial();
 void checkWiFiConnection();
-void handleFlipSwitches();
+void handleTouchSensors();
 void handleVC02Commands();
-void processVC02Command(String command);
-void sendStateToVC02(String device, bool state);
+void processVC02Command(uint16_t hexCommand);
+void sendStateToVC02(String deviceName, bool state);
+void setRelayState(int relayPIN, bool state);
+bool getRelayState(int relayPIN);
 bool onPowerState(String deviceId, bool &state);
 String getDeviceIdByName(String deviceName);
 
+// ====== Relay Control Functions (Active LOW Logic) ======
+void setRelayState(int relayPIN, bool state) {
+  // Active LOW relay: LOW = ON, HIGH = OFF
+  // state: true = ON, false = OFF
+  if (state) {
+    digitalWrite(relayPIN, LOW);   // LOW = Relay ON (GND)
+  } else {
+    digitalWrite(relayPIN, HIGH);  // HIGH = Relay OFF (3.3V)
+  }
+}
+
+bool getRelayState(int relayPIN) {
+  // Read current relay state
+  // Active LOW: LOW = ON (true), HIGH = OFF (false)
+  return (digitalRead(relayPIN) == LOW);
+}
+
 // ====== Setup Functions ======
 void setupRelays() { 
+  Serial.println("[Setup] Initializing relays (Active LOW)...");
+  
   for (auto &device : devices) {
     int relayPIN = device.second.relayPIN;
     pinMode(relayPIN, OUTPUT);
-    digitalWrite(relayPIN, LOW); // Initialize relays to OFF
+    setRelayState(relayPIN, false); // Initialize all relays to OFF
+    
+    Serial.printf("  Relay %s (Pin %d): OFF\r\n", 
+                  device.second.deviceName.c_str(), relayPIN);
   }
-  Serial.println("[Setup] Relays initialized");
+  
+  Serial.println("[Setup] Relays initialized successfully");
 }
 
-void setupFlipSwitches() {
+void setupTouchSensors() {
+  Serial.println("[Setup] Initializing touch sensors (Active HIGH)...");
+  
   for (auto &device : devices) {
-    flipSwitchConfig_t flipSwitchConfig;
-    flipSwitchConfig.deviceId = device.first;
-    flipSwitchConfig.lastFlipSwitchChange = 0;
-    flipSwitchConfig.lastFlipSwitchState = false;
+    touchSensorConfig_t sensorConfig;
+    sensorConfig.deviceId = device.first;
+    sensorConfig.lastTouchChange = 0;
+    sensorConfig.lastTouchState = false;
     
-    int flipSwitchPIN = device.second.flipSwitchPIN;
-    bool activeLow = device.second.activeLow;
-    flipSwitchConfig.activeLow = activeLow;
-    flipSwitches[flipSwitchPIN] = flipSwitchConfig;
+    int sensorPIN = device.second.touchSensorPIN;
+    pinMode(sensorPIN, INPUT);  // Touch sensors are active HIGH
     
-    if(activeLow) {
-      pinMode(flipSwitchPIN, INPUT_PULLUP);
-    } else {
-      pinMode(flipSwitchPIN, INPUT);
-    }
+    touchSensors[sensorPIN] = sensorConfig;
+    
+    Serial.printf("  Touch Sensor %s (Pin %d): Ready\r\n", 
+                  device.second.deviceName.c_str(), sensorPIN);
   }
-  Serial.println("[Setup] Flip switches initialized");
+  
+  Serial.println("[Setup] Touch sensors initialized successfully");
 }
 
 void setupWiFi() {
@@ -208,7 +239,7 @@ void setupVC02Serial() {
   #endif
   
   Serial.println("[VC02] UART initialized");
-  Serial.printf("[VC02] RX Pin: %d, TX Pin: %d, Baud: %d\r\n", 
+  Serial.printf("[VC02] RX: GPIO%d (D6), TX: GPIO%d (D7), Baud: %d\r\n", 
                 VC02_RX_PIN, VC02_TX_PIN, VC02_BAUD_RATE);
 }
 
@@ -225,19 +256,15 @@ void checkWiFiConnection() {
         wifiConnected = false;
         sinricConnected = false;
       }
-      
       WiFi.reconnect();
       delay(100);
-      
     } else {
-      // Check signal strength
       int32_t rssi = WiFi.RSSI();
       
       if(!wifiConnected) {
         wifiConnected = true;
         Serial.printf("[WiFi] Reconnected! IP: %s\r\n", WiFi.localIP().toString().c_str());
         
-        // Reinitialize SinricPro after reconnection
         if(!sinricConnected) {
           setupSinricPro();
         }
@@ -252,158 +279,181 @@ void checkWiFiConnection() {
 
 // ====== Device Control Functions ======
 bool onPowerState(String deviceId, bool &state) {
-  // Add delay to ensure WiFi stability before responding
   if(wifiConnected) {
     delay(RELAY_RESPONSE_DELAY);
   }
   
-  Serial.printf("[SinricPro] Device %s: %s\r\n", 
-                deviceId.c_str(), state ? "ON" : "OFF");
+  Serial.printf("[SinricPro] %s: %s\r\n", 
+                devices[deviceId].deviceName.c_str(), 
+                state ? "ON" : "OFF");
   
   int relayPIN = devices[deviceId].relayPIN;
-  digitalWrite(relayPIN, state);
+  setRelayState(relayPIN, state);
   
-  // Send confirmation to VC02
   String deviceName = devices[deviceId].deviceName;
   sendStateToVC02(deviceName, state);
   
   return true;
 }
 
-void handleFlipSwitches() {
-  unsigned long actualMillis = millis();
+// ====== Touch Sensor Handler (Active HIGH, Toggle behavior) ======
+void handleTouchSensors() {
+  unsigned long currentMillis = millis();
   
-  for (auto &flipSwitch : flipSwitches) {
-    unsigned long lastFlipSwitchChange = flipSwitch.second.lastFlipSwitchChange;
-
-    if (actualMillis - lastFlipSwitchChange > DEBOUNCE_TIME) {
-      int flipSwitchPIN = flipSwitch.first;
-      bool lastFlipSwitchState = flipSwitch.second.lastFlipSwitchState;
-      bool activeLow = flipSwitch.second.activeLow;
-      bool flipSwitchState = digitalRead(flipSwitchPIN);
-      
-      if(activeLow) flipSwitchState = !flipSwitchState;
-
-      if (flipSwitchState != lastFlipSwitchState) {
-#ifdef TACTILE_BUTTON
-        if (flipSwitchState) {
-#endif      
-          flipSwitch.second.lastFlipSwitchChange = actualMillis;
-          String deviceId = flipSwitch.second.deviceId;
-          int relayPIN = devices[deviceId].relayPIN;
-          bool newRelayState = !digitalRead(relayPIN);
-          digitalWrite(relayPIN, newRelayState);
-
-          Serial.printf("[FlipSwitch] Device %s: %s\r\n", 
-                        deviceId.c_str(), newRelayState ? "ON" : "OFF");
-
-          // Send to cloud if connected
-          if(wifiConnected && sinricConnected) {
-            SinricProSwitch &mySwitch = SinricPro[deviceId];
-            mySwitch.sendPowerStateEvent(newRelayState);
-          }
-          
-          // Send to VC02
-          String deviceName = devices[deviceId].deviceName;
-          sendStateToVC02(deviceName, newRelayState);
-          
-#ifdef TACTILE_BUTTON
-        }
-#endif      
-        flipSwitch.second.lastFlipSwitchState = flipSwitchState;
-      }
-    }
-  }
-}
-
-// ====== VC02 UART Communication ======
-void handleVC02Commands() {
-  while (VC02Serial.available()) {
-    char c = VC02Serial.read();
+  for (auto &sensor : touchSensors) {
+    int sensorPIN = sensor.first;
+    touchSensorConfig_t &config = sensor.second;
     
-    if (c == '\n' || c == '\r') {
-      if (uartBuffer.length() > 0) {
-        processVC02Command(uartBuffer);
-        uartBuffer = "";
-      }
-    } else {
-      uartBuffer += c;
+    // Check debounce time
+    if (currentMillis - config.lastTouchChange < DEBOUNCE_TIME) {
+      continue;
+    }
+    
+    // Read touch sensor (Active HIGH - HIGH when touched)
+    bool currentTouchState = digitalRead(sensorPIN);
+    
+    // Detect touch (transition from LOW to HIGH)
+    if (currentTouchState == HIGH && config.lastTouchState == LOW) {
+      config.lastTouchChange = currentMillis;
+      config.lastTouchState = currentTouchState;
       
-      // Process command if we have 4 characters (e.g., "AA11")
-      if (uartBuffer.length() >= 4) {
-        processVC02Command(uartBuffer);
-        uartBuffer = "";
+      // Toggle relay on touch
+      String deviceId = config.deviceId;
+      int relayPIN = devices[deviceId].relayPIN;
+      
+      // Get current relay state and toggle it
+      bool currentRelayState = getRelayState(relayPIN);
+      bool newRelayState = !currentRelayState;
+      
+      setRelayState(relayPIN, newRelayState);
+      
+      Serial.printf("[Touch] %s sensor touched -> %s\r\n", 
+                    devices[deviceId].deviceName.c_str(),
+                    newRelayState ? "ON" : "OFF");
+      
+      // Sync to cloud if connected
+      if(wifiConnected && sinricConnected) {
+        SinricProSwitch &mySwitch = SinricPro[deviceId];
+        mySwitch.sendPowerStateEvent(newRelayState);
       }
+      
+      // Send to VC02
+      sendStateToVC02(devices[deviceId].deviceName, newRelayState);
+    }
+    
+    // Update last state when touch is released (HIGH to LOW)
+    if (currentTouchState == LOW && config.lastTouchState == HIGH) {
+      config.lastTouchState = currentTouchState;
     }
   }
 }
 
-void processVC02Command(String command) {
-  command.trim();
-  command.toUpperCase();
-  
-  Serial.printf("[VC02] Received: %s\r\n", command.c_str());
-  
+// ====== VC02 UART Communication (Binary Hex Format) ======
+void handleVC02Commands() {
+  if (VC02Serial.available() >= 2) {
+    // Read two bytes from VC02
+    byte highByte = VC02Serial.read();
+    byte lowByte = VC02Serial.read();
+    
+    // Combine the two bytes into a single 16-bit hex value
+    receivedValue = (highByte << 8) | lowByte;
+    
+    // Print the received value in HEX format
+    Serial.print("[VC02] Received HEX value: 0x");
+    Serial.println(receivedValue, HEX);
+    
+    // Process the hex command
+    processVC02Command(receivedValue);
+  }
+}
+
+void processVC02Command(uint16_t hexCommand) {
   String deviceName = "";
   bool newState = false;
+  bool validCommand = false;
   
-  // Parse command
-  if (command == "AA00") {
-    deviceName = "LED";
-    newState = false;
-  } else if (command == "AA11") {
-    deviceName = "LED";
-    newState = true;
-  } else if (command == "BB00") {
-    deviceName = "FAN";
-    newState = false;
-  } else if (command == "BB11") {
-    deviceName = "FAN";
-    newState = true;
-  } else {
-    Serial.printf("[VC02] Unknown command: %s\r\n", command.c_str());
+  // Parse VC02 hex commands using switch statement
+  switch(hexCommand) {
+    case 0xAA00:  // LED OFF
+      deviceName = "LED";
+      newState = false;
+      validCommand = true;
+      break;
+      
+    case 0xAA11:  // LED ON
+      deviceName = "LED";
+      newState = true;
+      validCommand = true;
+      break;
+      
+    case 0xBB00:  // FAN OFF
+      deviceName = "FAN";
+      newState = false;
+      validCommand = true;
+      break;
+      
+    case 0xBB11:  // FAN ON
+      deviceName = "FAN";
+      newState = true;
+      validCommand = true;
+      break;
+      
+    default:
+      Serial.printf("[VC02] Unknown HEX command: 0x%04X\r\n", hexCommand);
+      return;
+  }
+  
+  if(!validCommand) {
     return;
   }
   
-  // Get device ID
+  // Get device ID and control relay
   String deviceId = getDeviceIdByName(deviceName);
   if (deviceId == "") {
     Serial.printf("[VC02] Device not found: %s\r\n", deviceName.c_str());
     return;
   }
   
-  // Control relay
   int relayPIN = devices[deviceId].relayPIN;
-  digitalWrite(relayPIN, newState);
+  setRelayState(relayPIN, newState);
   
-  Serial.printf("[VC02] %s turned %s\r\n", 
-                deviceName.c_str(), newState ? "ON" : "OFF");
+  Serial.printf("[VC02] %s turned %s (0x%04X)\r\n", 
+                deviceName.c_str(), newState ? "ON" : "OFF", hexCommand);
   
-  // Send to cloud if connected
+  // Sync to cloud if connected
   if(wifiConnected && sinricConnected) {
     delay(RELAY_RESPONSE_DELAY);
     SinricProSwitch &mySwitch = SinricPro[deviceId];
     mySwitch.sendPowerStateEvent(newState);
   }
   
-  // Send acknowledgment back to VC02
-  VC02Serial.print("OK:");
-  VC02Serial.println(command);
+  // Send acknowledgment with hex value
+  VC02Serial.print("OK:0x");
+  VC02Serial.println(hexCommand, HEX);
+  
+  // Reset received value
+  receivedValue = 0;
 }
 
 void sendStateToVC02(String deviceName, bool state) {
-  String command = "";
+  uint16_t hexValue = 0;
   
+  // Convert device state to hex value
   if (deviceName == "LED") {
-    command = state ? "AA11" : "AA00";
+    hexValue = state ? 0xAA11 : 0xAA00;
   } else if (deviceName == "FAN") {
-    command = state ? "BB11" : "BB00";
+    hexValue = state ? 0xBB11 : 0xBB00;
   }
   
-  if (command != "") {
-    VC02Serial.print("STATE:");
-    VC02Serial.println(command);
-    Serial.printf("[VC02] Sent state: %s\r\n", command.c_str());
+  if (hexValue != 0) {
+    // Send hex value as two bytes
+    byte highByte = (hexValue >> 8) & 0xFF;
+    byte lowByte = hexValue & 0xFF;
+    
+    VC02Serial.write(highByte);
+    VC02Serial.write(lowByte);
+    
+    Serial.printf("[VC02] Sent state: 0x%04X\r\n", hexValue);
   }
 }
 
@@ -422,33 +472,50 @@ void setup() {
   delay(500);
   
   Serial.println("\r\n========================================");
-  Serial.println("ESP SinricPro + VC02 Voice Controller");
+  Serial.println("ESP8266 Home Automation System");
+  Serial.println("Active-LOW Relays | Active-HIGH Touch");
   Serial.println("========================================\r\n");
   
   setupRelays();
-  setupFlipSwitches();
+  setupTouchSensors();
   setupVC02Serial();
   setupWiFi();
   setupSinricPro();
   
-  Serial.println("\r\n[System] Setup complete! Ready for operation.\r\n");
+  Serial.println("\r\n========================================");
+  Serial.println("[System] Initialization Complete!");
+  Serial.println("[System] Ready for operation");
+  Serial.println("========================================\r\n");
+  
+  // Display pin configuration
+  Serial.println("[Info] Pin Configuration:");
+  Serial.println("  Touch Sensors:");
+  Serial.printf("    LED: D1 (GPIO%d)\r\n", TOUCH_SENSOR_LED);
+  Serial.printf("    FAN: D2 (GPIO%d)\r\n", TOUCH_SENSOR_FAN);
+  Serial.println("  Relays (Active LOW):");
+  Serial.printf("    LED: D5 (GPIO%d)\r\n", RELAY_LED);
+  Serial.printf("    FAN: D7 (GPIO%d)\r\n", RELAY_FAN);
+  Serial.println("  VC02 UART:");
+  Serial.printf("    RX: D6 (GPIO%d)\r\n", VC02_RX_PIN);
+  Serial.printf("    TX: RX (GPIO%d)\r\n", VC02_TX_PIN);
+  Serial.println("========================================\r\n");
 }
 
 void loop() {
-  // Handle WiFi connection monitoring
+  // WiFi connection monitoring
   checkWiFiConnection();
   
-  // Handle SinricPro only if WiFi connected
+  // SinricPro cloud handling
   if(wifiConnected) {
     SinricPro.handle();
   }
   
-  // Handle manual switches (always works)
-  handleFlipSwitches();
+  // Touch sensor monitoring (always active)
+  handleTouchSensors();
   
-  // Handle VC02 UART commands (always works)
+  // VC02 UART command handling (always active)
   handleVC02Commands();
   
-  // Small delay to prevent WDT reset
+  // Prevent WDT reset
   delay(1);
 }
